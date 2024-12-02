@@ -1,12 +1,8 @@
-use ethers::{
-    signers::{LocalWallet, Signer},
-    utils::keccak256,
-};
-use hex::encode;
+use ethers::signers::{LocalWallet, Signer};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, to_string};
+use serde_json::{json, to_string, Value};
 use std::{
     error::Error,
     time::{SystemTime, UNIX_EPOCH},
@@ -142,6 +138,7 @@ impl User {
         let key_pair = generate_key_pair();
         let public_key = key_pair.public_key;
         let private_key = key_pair.private_key;
+
         let prepared_public_key = prepare_pgp_public_key(&version, &public_key)?;
         let encrypted_private_key = to_string(&encrypt_private_key(
             &version,
@@ -171,8 +168,8 @@ impl User {
             "encryptedPrivateKey": encrypted_private_key,
         });
 
-        let hash = keccak256(to_string(&data_to_sign)?.as_bytes());
-        let signature_obj = get_eip191_signature(signer, &hex::encode(hash), "v2").await?;
+        let verification_proof =
+            get_eip191_signature(signer, &to_string(&data_to_sign)?, &version).await?;
 
         let mut payload = json!({
             "caip10": user,
@@ -182,7 +179,9 @@ impl User {
             "origin": "push_crate",
         });
         let create_payload = payload.as_object_mut().unwrap();
-        create_payload.extend(signature_obj.as_object().unwrap().clone());
+        create_payload.extend(verification_proof.as_object().unwrap().clone());
+
+        println!("{:?}", create_payload);
 
         let create_response = client
             .post(&create_url)
@@ -304,16 +303,22 @@ fn is_valid_evm_address(address: &str) -> bool {
 
 async fn get_eip191_signature(
     wallet: &LocalWallet,
-    message: &str,
-    version: &str,
-) -> Result<serde_json::Value, Box<dyn Error>> {
-    let signature = wallet.sign_message(message.as_bytes()).await?;
-    let sig_type = if version == "v1" {
+    message: &String,
+    version: &Version,
+) -> Result<Value, Box<dyn Error>> {
+    let signature = wallet.sign_message(message).await?;
+
+    let sig_type = if *version == Version::EncTypeV1 {
         "eip191"
     } else {
         "eip191v2"
     };
-    let verification_proof = format!("{}:{}", sig_type, hex::encode(signature.to_vec()));
+
+    let verification_proof = format!(
+        "{}:{}",
+        sig_type,
+        format!("0x{}", hex::encode(signature.to_vec()))
+    );
 
     Ok(json!({ "verificationProof": verification_proof }))
 }

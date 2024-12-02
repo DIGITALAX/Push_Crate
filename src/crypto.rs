@@ -87,14 +87,12 @@ pub fn encrypt_private_key(
                 ciphertext: encode(encrypted.ciphertext),
                 salt: encode(encrypted.salt),
                 nonce: encode(encrypted.nonce),
-                version: Version::EncTypeV1.as_str().to_string(),
+                version: encryption_type.as_str().to_string(),
                 pre_key: "".to_string(),
             })
         }
         Version::EncTypeV2 | Version::EncTypeV3 | Version::EncTypeV4 => {
-            if *encryption_type == Version::EncTypeV4 && additional_meta.is_none() {
-                return Err("Password is required for ENC_TYPE_V4");
-            }
+            let (salt, nonce) = generate_salt_and_nonce();
             let secret_key = match encryption_type {
                 Version::EncTypeV2 => secret.to_vec(),
                 Version::EncTypeV3 | Version::EncTypeV4 => {
@@ -104,9 +102,7 @@ pub fn encrypt_private_key(
                         .ok_or("Missing NFTPGP_V1 in additional_meta")?
                         .password
                         .clone();
-
-                    let password_bytes = password.as_bytes();
-                    hkdf_generate(password_bytes, 32)
+                    hkdf_generate(password.as_bytes(), &salt, 32)?
                 }
                 _ => return Err("Unsupported Encryption Type"),
             };
@@ -115,21 +111,17 @@ pub fn encrypt_private_key(
 
             Ok(EncryptedPrivateKey {
                 ciphertext: encode(encrypted.ciphertext),
-                salt: encode(encrypted.salt.clone()),
-                nonce: encode(encrypted.nonce),
+                salt: encode(salt.clone()),
+                nonce: encode(nonce),
                 version: encryption_type.as_str().to_string(),
-                pre_key: String::from_utf8_lossy(&encrypted.salt).to_string(),
+                pre_key: encode(&generate_random_secret(32)),
             })
         }
     }
 }
 
-pub fn aes_gcm_encrypt(data: &[u8], secret: &[u8]) -> Result<AesGcmEncrypted, &'static str> {
-    let mut rng = rand::thread_rng();
-
-    let salt: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-    let nonce: Vec<u8> = (0..12).map(|_| rng.gen()).collect();
-
+fn aes_gcm_encrypt(data: &[u8], secret: &[u8]) -> Result<AesGcmEncrypted, &'static str> {
+    let (salt, nonce) = generate_salt_and_nonce();
     let hk = Hkdf::<Sha256>::new(Some(&salt), secret);
     let mut key = [0u8; 32];
     hk.expand(b"", &mut key)
@@ -147,13 +139,14 @@ pub fn aes_gcm_encrypt(data: &[u8], secret: &[u8]) -> Result<AesGcmEncrypted, &'
     })
 }
 
-pub fn hkdf_generate(secret: &[u8], length: usize) -> Vec<u8> {
-    let salt: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
-    let hk = Hkdf::<Sha256>::new(Some(&salt), secret);
+fn hkdf_generate(secret: &[u8], salt: &[u8], length: usize) -> Result<Vec<u8>, &'static str> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), secret);
     let mut okm = vec![0u8; length];
-    hk.expand(b"", &mut okm).expect("HKDF failed");
-    okm
+    hk.expand(b"", &mut okm)
+        .map_err(|_| "HKDF expansion failed")?;
+    Ok(okm)
 }
+
 pub async fn decrypt_pgp_key(
     encrypted_pgp_private_key: &str,
     signer: &LocalWallet,
@@ -252,4 +245,18 @@ async fn get_eip191_signature(
 ) -> Result<String, Box<dyn Error>> {
     let signature = wallet.sign_message(message.as_bytes()).await?;
     Ok(encode(signature.to_vec()))
+}
+
+fn generate_salt_and_nonce() -> (Vec<u8>, Vec<u8>) {
+    let mut rng = rand::thread_rng();
+    let salt: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+    let nonce: Vec<u8> = (0..12).map(|_| rng.gen()).collect();
+    (salt, nonce)
+}
+
+fn generate_random_secret(length: usize) -> String {
+    let mut rng = rand::thread_rng();
+    (0..length)
+        .map(|_| format!("{:02x}", rng.gen::<u8>()))
+        .collect()
 }
