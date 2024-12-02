@@ -54,9 +54,9 @@ impl PushAPI {
         create: bool,
         decrypted_pgp_pvt_key: Option<String>,
         pgp_public_key: Option<String>,
-        additional_metadata: Option<AdditionalMeta>
+        additional_metadata: Option<AdditionalMeta>,
     ) -> Result<(), Box<dyn Error>> {
-        if self.account.is_none() && !self.signer.is_none() {
+        if self.account.is_none() && self.signer.is_none() {
             return Err("Must provide either an account or a signer".into());
         }
 
@@ -77,12 +77,16 @@ impl PushAPI {
                 decrypted_pgp_pvt_key,
                 pgp_public_key,
                 &version,
-                additional_metadata
+                additional_metadata,
             )
             .await?;
         } else if create && self.signer.is_some() {
-            user.create(&self.signer.clone().unwrap(), &api_base_url, &version)
-                .await?;
+            user.create(
+                &self.signer.clone().unwrap(),
+                &api_base_url,
+                &version,
+            )
+            .await?;
         }
 
         self.user = Some(user);

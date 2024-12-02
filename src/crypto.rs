@@ -3,7 +3,7 @@ use aes::cipher::generic_array::GenericArray;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
 use base64::{engine::general_purpose, Engine as _};
 use ethers::signers::{LocalWallet, Signer};
-use hex::encode;
+use hex::{decode, encode};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, Rng};
 use rsa::{
@@ -174,7 +174,7 @@ pub async fn decrypt_pgp_key(
             let enable_profile_message = format!("Enable Push Chat Profile \n{}", pre_key);
 
             let secret = get_eip712_signature(&enable_profile_message, signer).await?;
-            let decrypted = decrypt_v2(&parsed_key, &hex::decode(secret)?)?;
+            let decrypted = decrypt_v2(&parsed_key, &decode(secret)?)?;
             Ok(String::from_utf8(decrypted)?)
         }
         Version::EncTypeV3 => {
@@ -184,7 +184,7 @@ pub async fn decrypt_pgp_key(
             let enable_profile_message = format!("Enable Push Profile \n{}", pre_key);
 
             let secret = get_eip191_signature(&enable_profile_message, signer).await?;
-            let decrypted = decrypt_v2(&parsed_key, &hex::decode(secret)?)?;
+            let decrypted = decrypt_v2(&parsed_key, &decode(secret)?)?;
             Ok(String::from_utf8(decrypted)?)
         }
         Version::EncTypeV4 => {
@@ -198,7 +198,7 @@ pub async fn decrypt_pgp_key(
                 return Err("Password required for ENC_TYPE_V4".into());
             };
 
-            let decrypted = decrypt_v2(&parsed_key, &hex::decode(password)?)?;
+            let decrypted = decrypt_v2(&parsed_key, &decode(password)?)?;
             Ok(String::from_utf8(decrypted)?)
         }
     }
@@ -213,12 +213,12 @@ async fn decrypt_v1(parsed_key: &Value, wallet: &LocalWallet) -> Result<String, 
 }
 
 fn decrypt_v2(parsed_key: &Value, secret: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-    let encrypted_data = hex::decode(
+    let encrypted_data = decode(
         parsed_key["encryptedData"]
             .as_str()
             .ok_or("Missing encrypted data in ENC_TYPE_V2")?,
     )?;
-    let nonce = hex::decode(
+    let nonce = decode(
         parsed_key["nonce"]
             .as_str()
             .ok_or("Missing nonce in ENC_TYPE_V2")?,
@@ -243,7 +243,7 @@ async fn get_eip712_signature(
     wallet: &LocalWallet,
 ) -> Result<String, Box<dyn Error>> {
     let signature = wallet.sign_message(message.as_bytes()).await?;
-    Ok(hex::encode(signature.to_vec()))
+    Ok(encode(signature.to_vec()))
 }
 
 async fn get_eip191_signature(
@@ -251,5 +251,5 @@ async fn get_eip191_signature(
     wallet: &LocalWallet,
 ) -> Result<String, Box<dyn Error>> {
     let signature = wallet.sign_message(message.as_bytes()).await?;
-    Ok(hex::encode(signature.to_vec()))
+    Ok(encode(signature.to_vec()))
 }

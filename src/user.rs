@@ -1,13 +1,16 @@
 use ethers::{
     signers::{LocalWallet, Signer},
-    types::H256,
     utils::keccak256,
 };
+use hex::encode;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::error::Error;
+use serde_json::{json, to_string};
+use std::{
+    error::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     crypto::{decrypt_pgp_key, encrypt_private_key, generate_key_pair, prepare_pgp_public_key},
@@ -133,7 +136,6 @@ impl User {
     ) -> Result<Self, Box<dyn Error>> {
         let client = Client::new();
         let create_url = format!("{}/v2/users/", api_base_url);
-
         let additional_meta = get_additional_meta();
         let secret = get_secret(&version, signer).await?;
 
@@ -141,34 +143,52 @@ impl User {
         let public_key = key_pair.public_key;
         let private_key = key_pair.private_key;
         let prepared_public_key = prepare_pgp_public_key(&version, &public_key)?;
-        let encrypted_private_key =
-            encrypt_private_key(&version, &private_key, &secret, additional_meta);
+        let encrypted_private_key = to_string(&encrypt_private_key(
+            &version,
+            &private_key,
+            &secret,
+            additional_meta,
+        )?)
+        .map_err(|_| "Failed to serialize encryptedPrivateKey")?;
+
+        let caip10 = wallet_to_pcaip10(&signer.address().to_string());
+
+        let user = if is_valid_nft_caip(&caip10) {
+            let epoch = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            if caip10.split(':').count() != 6 {
+                format!("{}:{}", caip10, epoch)
+            } else {
+                caip10.clone()
+            }
+        } else {
+            caip10.clone()
+        };
 
         let data_to_sign = json!({
-            "caip10": signer.address().to_string(),
-            "did": signer.address().to_string(),
+            "caip10": user,
+            "did": user,
             "publicKey": prepared_public_key,
             "encryptedPrivateKey": encrypted_private_key,
         });
 
-        let hash = keccak256(serde_json::to_string(&data_to_sign)?.as_bytes());
-        let signature = signer.sign_message(H256::from(hash)).await?;
+        let hash = keccak256(to_string(&data_to_sign)?.as_bytes());
+        let signature_obj = get_eip191_signature(signer, &hex::encode(hash), "v2").await?;
 
-        let create_payload = json!({
-            "caip10": signer.address().to_string(),
-            "did": signer.address().to_string(),
+        let mut payload = json!({
+            "caip10": user,
+            "did": user,
             "publicKey": prepared_public_key,
             "encryptedPrivateKey": encrypted_private_key,
             "origin": "push_crate",
-            "signature": format!("0x{:?}", signature.to_vec())
         });
+        let create_payload = payload.as_object_mut().unwrap();
+        create_payload.extend(signature_obj.as_object().unwrap().clone());
 
         let create_response = client
             .post(&create_url)
             .json(&create_payload)
             .send()
             .await?;
-
         if create_response.status().is_success() {
             let data = create_response.json::<User>().await?;
             Ok(User {
@@ -196,9 +216,9 @@ impl User {
 
 fn wallet_to_pcaip10(account: &str) -> String {
     if account.contains("eip155:") {
-        account.to_string()
+        account.to_lowercase()
     } else {
-        format!("eip155:{}", account)
+        format!("eip155:{}", account.to_lowercase())
     }
 }
 
@@ -238,4 +258,62 @@ fn get_additional_meta() -> Option<AdditionalMeta> {
             password: format!("$0Pc{}", generate_random_secret(10)),
         }),
     })
+}
+
+fn is_valid_nft_caip(wallet: &str) -> bool {
+    let wallet_component: Vec<&str> = wallet.split(':').collect();
+
+    if wallet_component.len() != 5 && wallet_component.len() != 6 {
+        return false;
+    }
+
+    if wallet_component[0].to_lowercase() != "nft" {
+        return false;
+    }
+
+    if wallet_component[1] != "eip155" {
+        return false;
+    }
+
+    if wallet_component[2].parse::<u64>().is_err()
+        || wallet_component[2].parse::<u64>().unwrap() <= 0
+    {
+        return false;
+    }
+
+    if wallet_component[4].parse::<u64>().is_err()
+        || wallet_component[4].parse::<u64>().unwrap() <= 0
+    {
+        return false;
+    }
+
+    if !is_valid_evm_address(wallet_component[3]) {
+        return false;
+    }
+
+    true
+}
+
+fn is_valid_evm_address(address: &str) -> bool {
+    if address.len() != 42 || !address.starts_with("0x") {
+        return false;
+    }
+
+    address[2..].chars().all(|c| c.is_digit(16))
+}
+
+async fn get_eip191_signature(
+    wallet: &LocalWallet,
+    message: &str,
+    version: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let signature = wallet.sign_message(message.as_bytes()).await?;
+    let sig_type = if version == "v1" {
+        "eip191"
+    } else {
+        "eip191v2"
+    };
+    let verification_proof = format!("{}:{}", sig_type, hex::encode(signature.to_vec()));
+
+    Ok(json!({ "verificationProof": verification_proof }))
 }
