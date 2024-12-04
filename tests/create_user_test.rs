@@ -6,7 +6,8 @@ mod tests {
         config::Env,
         push_api::{PushAPI, Version},
     };
-    use std::{env, str::FromStr, sync::Once};
+    use rand::rngs::OsRng;
+    use std::sync::Once;
 
     static INIT: Once = Once::new();
 
@@ -21,9 +22,11 @@ mod tests {
         dotenv().ok();
         setup_logging();
 
-        let signer =
-            LocalWallet::from_str(&env::var("SIGNER").expect("SIGNER must be set in .env file"))
-                .expect("Failed to create LocalWallet");
+        // let signer =
+        //     LocalWallet::from_str(&env::var("SIGNER").expect("SIGNER must be set in .env file"))
+        //         .expect("Failed to create LocalWallet");
+        let mut rng = OsRng;
+        let signer = LocalWallet::new(&mut rng);
 
         let mut push = PushAPI::new(Env::Staging, Some(signer), None, Some(Version::EncTypeV3));
         let result = push.initialize(true, None, None, None).await;

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::push_api::Version;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Env {
     Prod,
@@ -20,8 +22,8 @@ impl Env {
 
 const API_BASE_URL: &[(Env, &str)] = &[
     (Env::Prod, "https://backend.epns.io/apis"),
-    (Env::Staging, "https://backend-staging.epns.io/apis"),
-    (Env::Dev, "https://backend-dev.epns.io/apis"),
+    (Env::Staging, "https://backend.epns.io/apis"),
+    (Env::Dev, "https://backend.epns.io/apis"),
 ];
 
 const COMMUNICATOR_CONTRACT: &[(Env, &str)] = &[
@@ -34,6 +36,13 @@ const BLOCKCHAIN_NETWORK: &[(&str, &str)] = &[
     ("ETH_MAINNET", "eip155:1"),
     ("POLYGON_MAINNET", "eip155:137"),
     ("POLYGON_AMOY", "eip155:80002"),
+];
+
+ const VERSIONS: &[(Version, &str)] = &[
+    (Version::EncTypeV1, "x25519-xsalsa20-poly1305"),
+    (Version::EncTypeV2, "aes256GcmHkdfSha256"),
+    (Version::EncTypeV3, "eip191-aes256-gcm-hkdf-sha256"),
+    (Version::EncTypeV4, "pgpv1:nft"),
 ];
 
 const ETH_CHAIN_ID: &[(Env, u32)] = &[
@@ -60,6 +69,14 @@ impl NetworkConfig {
         }
     }
 }
+
+pub fn get_version(version: &Version) -> Option<&'static str> {
+    VERSIONS
+        .iter()
+        .find(|(v, _)| v == version)
+        .map(|(_, url)| *url)
+}
+
 
 pub fn get_api_base_url(env: &Env) -> Option<&'static str> {
     API_BASE_URL

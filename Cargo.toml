@@ -14,7 +14,6 @@ env_logger = "0.11.5"
 ethers = {version = "2.0.14"}
 hex = "0.4.3"
 hkdf = "0.12.4"
-pgp-lib = "1.0.0"
 rand = "0.8.5"
 reqwest = {version = "0.12.9",  features = ["json"]}
 rsa = "0.9.7"

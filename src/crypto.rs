@@ -1,7 +1,7 @@
-use crate::{push_api::Version, user::AdditionalMeta};
+use crate::{config::get_version, push_api::Version, user::AdditionalMeta};
 use aes::cipher::generic_array::GenericArray;
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use ethers::signers::{LocalWallet, Signer};
 use hex::{decode, encode};
 use hkdf::Hkdf;
@@ -13,7 +13,10 @@ use rsa::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::error::Error;
+use std::{
+    error::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyPair {
@@ -37,25 +40,65 @@ pub struct EncryptedPrivateKey {
     pub pre_key: String,
 }
 
-pub fn generate_key_pair() -> KeyPair {
+pub fn generate_key_pair() -> Result<KeyPair, Box<dyn std::error::Error>> {
     let mut rng = OsRng;
-    let bits = 2048;
-    let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
+    let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
     let public_key = RsaPublicKey::from(&private_key);
-    KeyPair {
-        private_key: general_purpose::STANDARD.encode(
-            private_key
-                .to_pkcs1_der()
-                .expect("Failed to encode private key")
-                .as_bytes(),
-        ),
-        public_key: general_purpose::STANDARD.encode(
-            public_key
-                .to_pkcs1_der()
-                .expect("Failed to encode public key")
-                .as_ref(),
-        ),
+
+    let private_key_der = private_key.to_pkcs1_der()?;
+    let private_key_encrypted = private_key_der.as_bytes().to_vec();
+    let public_key_der = public_key.to_pkcs1_der()?.as_ref().to_vec();
+    let creation_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as u32;
+    let public_key_packet = format_openpgp_public_key(&public_key_der, "", creation_time)?;
+    let private_key_packet = format_openpgp_private_key(&private_key_encrypted, "")?;
+    Ok(KeyPair {
+        public_key: public_key_packet,
+        private_key: STANDARD.encode(private_key_packet),
+    })
+}
+
+fn format_openpgp_public_key(
+    public_key: &[u8],
+    user_id: &str,
+    creation_time: u32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut packet = vec![];
+
+    packet.push(0x99);
+    let key_len = public_key.len() + 6;
+    packet.extend_from_slice(&(key_len as u16).to_be_bytes());
+    packet.push(0x04);
+    packet.extend_from_slice(&creation_time.to_be_bytes());
+    packet.push(0x01);
+    packet.extend_from_slice(public_key);
+
+    if !user_id.is_empty() {
+        packet.push(0xb4);
+        packet.extend_from_slice(&(user_id.len() as u16).to_be_bytes());
+        packet.extend_from_slice(user_id.as_bytes());
     }
+
+    let base64_key = STANDARD.encode(packet);
+    let formatted_key = format!(
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----",
+        base64_key
+    );
+
+    Ok(formatted_key)
+}
+
+fn format_openpgp_private_key(
+    private_key: &[u8],
+    user_id: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut packet = vec![];
+    packet.extend_from_slice(&[0x95]);
+    packet.extend_from_slice(&(private_key.len() as u16).to_be_bytes());
+    packet.extend_from_slice(private_key);
+
+    packet.extend_from_slice(user_id.as_bytes());
+
+    Ok(packet)
 }
 
 pub fn prepare_pgp_public_key(
@@ -74,7 +117,8 @@ pub fn prepare_pgp_public_key(
     }
 }
 
-pub fn encrypt_private_key(
+pub async fn encrypt_private_key(
+    wallet: &LocalWallet,
     encryption_type: &Version,
     private_key: &str,
     secret: &[u8],
@@ -82,69 +126,142 @@ pub fn encrypt_private_key(
 ) -> Result<EncryptedPrivateKey, &'static str> {
     match encryption_type {
         Version::EncTypeV1 => {
-            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), secret)?;
+            let (salt, nonce) = generate_salt_and_nonce();
+            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), secret, &salt, &nonce)?;
             Ok(EncryptedPrivateKey {
                 ciphertext: encode(encrypted.ciphertext),
-                salt: encode(encrypted.salt),
-                nonce: encode(encrypted.nonce),
-                version: encryption_type.as_str().to_string(),
+                salt: encode(salt),
+                nonce: encode(nonce),
+                version: get_version(encryption_type).unwrap().to_string(),
                 pre_key: "".to_string(),
             })
         }
-        Version::EncTypeV2 | Version::EncTypeV3 | Version::EncTypeV4 => {
-            let (salt, nonce) = generate_salt_and_nonce();
-            let secret_key = match encryption_type {
-                Version::EncTypeV2 => secret.to_vec(),
-                Version::EncTypeV3 | Version::EncTypeV4 => {
-                    let password = additional_meta
-                        .ok_or("Missing password")?
-                        .nftpgp_v1
-                        .ok_or("Missing NFTPGP_V1 in additional_meta")?
-                        .password
-                        .clone();
-                    hkdf_generate(password.as_bytes(), &salt, 32)?
-                }
-                _ => return Err("Unsupported Encryption Type"),
+        Version::EncTypeV2 => {
+            let input = generate_pre_key(32)?;
+
+            let enable_profile_message = format!("Enable Push Chat Profile \n{}", input);
+
+            let verification_proof = get_eip712_signature(wallet, &enable_profile_message)
+                .await
+                .map_err(|_| "Failed to get EIP712 signature")?;
+
+            let trimmed_proof = if verification_proof.starts_with("0x") {
+                &verification_proof[2..]
+            } else {
+                &verification_proof
             };
 
-            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), &secret_key)?;
+            if !trimmed_proof.chars().all(|c| c.is_digit(16)) {
+                return Err("Verification proof is not valid hexadecimal");
+            }
+
+            let secret_key =
+                decode(trimmed_proof).map_err(|_| "Failed to decode verification proof")?;
+
+            let (salt, nonce) = generate_salt_and_nonce();
+
+            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), &secret_key, &salt, &nonce)?;
 
             Ok(EncryptedPrivateKey {
                 ciphertext: encode(encrypted.ciphertext),
-                salt: encode(salt.clone()),
+                salt: encode(salt),
                 nonce: encode(nonce),
-                version: encryption_type.as_str().to_string(),
-                pre_key: encode(&generate_random_secret(32)),
+                version: get_version(encryption_type).unwrap().to_string(),
+                pre_key: input,
+            })
+        }
+
+        Version::EncTypeV3 => {
+            let input = generate_pre_key(32)?;
+
+            let enable_profile_message = format!("Enable Push Profile \n{}", input);
+
+            let verification_proof =
+                get_eip191_signature(wallet, &enable_profile_message, &Version::EncTypeV1)
+                    .await
+                    .map_err(|_| "Failed to get EIP191 signature")?;
+
+            let trimmed_proof = if verification_proof.starts_with("eip191:") {
+                &verification_proof[7..]
+            } else {
+                &verification_proof
+            };
+
+            let trimmed_proof = if trimmed_proof.starts_with("0x") {
+                &trimmed_proof[2..]
+            } else {
+                trimmed_proof
+            };
+
+            if !trimmed_proof.chars().all(|c| c.is_digit(16)) {
+                return Err("Verification proof is not valid hexadecimal");
+            }
+
+            let secret_key =
+                decode(trimmed_proof).map_err(|_| "Failed to decode verification proof")?;
+
+            let (salt, nonce) = generate_salt_and_nonce();
+
+            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), &secret_key, &salt, &nonce)?;
+
+            Ok(EncryptedPrivateKey {
+                ciphertext: encode(encrypted.ciphertext),
+                salt: encode(salt),
+                nonce: encode(nonce),
+                version: get_version(encryption_type).unwrap().to_string(),
+                pre_key: input,
+            })
+        }
+
+        Version::EncTypeV4 => {
+            let password = additional_meta
+                .ok_or("Missing additional metadata")?
+                .nftpgp_v1
+                .ok_or("Password is required in NFTPGP_V1")?
+                .password;
+
+            let input = generate_pre_key(32)?;
+
+            let password_hex = encode(password);
+            let secret_key =
+                decode(password_hex).map_err(|_| "Failed to decode password to hex")?;
+
+            let (salt, nonce) = generate_salt_and_nonce();
+
+            let encrypted = aes_gcm_encrypt(private_key.as_bytes(), &secret_key, &salt, &nonce)?;
+
+            Ok(EncryptedPrivateKey {
+                ciphertext: encode(encrypted.ciphertext),
+                salt: encode(salt),
+                nonce: encode(nonce),
+                version: get_version(encryption_type).unwrap().to_string(),
+                pre_key: input,
             })
         }
     }
 }
 
-fn aes_gcm_encrypt(data: &[u8], secret: &[u8]) -> Result<AesGcmEncrypted, &'static str> {
-    let (salt, nonce) = generate_salt_and_nonce();
-    let hk = Hkdf::<Sha256>::new(Some(&salt), secret);
+fn aes_gcm_encrypt(
+    data: &[u8],
+    secret: &[u8],
+    salt: &[u8],
+    nonce: &[u8],
+) -> Result<AesGcmEncrypted, &'static str> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), secret);
     let mut key = [0u8; 32];
     hk.expand(b"", &mut key)
         .map_err(|_| "Failed to expand HKDF key")?;
 
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
     let ciphertext = cipher
-        .encrypt(GenericArray::from_slice(&nonce), data)
+        .encrypt(GenericArray::from_slice(nonce), data)
         .map_err(|_| "Encryption failed")?;
 
     Ok(AesGcmEncrypted {
         ciphertext,
-        salt,
-        nonce,
+        salt: salt.to_vec(),
+        nonce: nonce.to_vec(),
     })
-}
-
-fn hkdf_generate(secret: &[u8], salt: &[u8], length: usize) -> Result<Vec<u8>, &'static str> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut okm = vec![0u8; length];
-    hk.expand(b"", &mut okm)
-        .map_err(|_| "HKDF expansion failed")?;
-    Ok(okm)
 }
 
 pub async fn decrypt_pgp_key(
@@ -166,7 +283,7 @@ pub async fn decrypt_pgp_key(
                 .ok_or("Missing preKey in encrypted PGP key")?;
             let enable_profile_message = format!("Enable Push Chat Profile \n{}", pre_key);
 
-            let secret = get_eip712_signature(&enable_profile_message, signer).await?;
+            let secret = get_eip712_signature(signer, &enable_profile_message).await?;
             let decrypted = decrypt_v2(&parsed_key, &decode(secret)?)?;
             Ok(String::from_utf8(decrypted)?)
         }
@@ -176,7 +293,8 @@ pub async fn decrypt_pgp_key(
                 .ok_or("Missing preKey in encrypted PGP key")?;
             let enable_profile_message = format!("Enable Push Profile \n{}", pre_key);
 
-            let secret = get_eip191_signature(&enable_profile_message, signer).await?;
+            let secret =
+                get_eip191_signature(signer, &enable_profile_message, &Version::EncTypeV1).await?;
             let decrypted = decrypt_v2(&parsed_key, &decode(secret)?)?;
             Ok(String::from_utf8(decrypted)?)
         }
@@ -231,22 +349,6 @@ fn decrypt_v2(parsed_key: &Value, secret: &[u8]) -> Result<Vec<u8>, Box<dyn Erro
     Ok(decrypted_data)
 }
 
-async fn get_eip712_signature(
-    message: &str,
-    wallet: &LocalWallet,
-) -> Result<String, Box<dyn Error>> {
-    let signature = wallet.sign_message(message.as_bytes()).await?;
-    Ok(encode(signature.to_vec()))
-}
-
-async fn get_eip191_signature(
-    message: &str,
-    wallet: &LocalWallet,
-) -> Result<String, Box<dyn Error>> {
-    let signature = wallet.sign_message(message.as_bytes()).await?;
-    Ok(encode(signature.to_vec()))
-}
-
 fn generate_salt_and_nonce() -> (Vec<u8>, Vec<u8>) {
     let mut rng = rand::thread_rng();
     let salt: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
@@ -254,9 +356,39 @@ fn generate_salt_and_nonce() -> (Vec<u8>, Vec<u8>) {
     (salt, nonce)
 }
 
-fn generate_random_secret(length: usize) -> String {
+fn generate_pre_key(length: usize) -> Result<String, &'static str> {
     let mut rng = rand::thread_rng();
-    (0..length)
-        .map(|_| format!("{:02x}", rng.gen::<u8>()))
-        .collect()
+    let mut buffer = vec![0u8; length];
+    rng.fill(buffer.as_mut_slice());
+    Ok(buffer.iter().map(|byte| format!("{:02x}", byte)).collect())
+}
+
+async fn get_eip712_signature(wallet: &LocalWallet, message: &str) -> Result<String, &'static str> {
+    let signed_message = wallet
+        .sign_message(message)
+        .await
+        .map_err(|_| "Failed to sign EIP712 message")?;
+    Ok(format!("0x{}", encode(signed_message.to_vec())))
+}
+
+pub async fn get_eip191_signature(
+    wallet: &LocalWallet,
+    message: &String,
+    version: &Version,
+) -> Result<String, Box<dyn Error>> {
+
+    let signature = wallet.sign_message(message.clone()).await?;
+    let sig_type = if *version == Version::EncTypeV1 {
+        "eip191"
+    } else {
+        "eip191v2"
+    };
+
+    let signed = format!(
+        "{}:{}",
+        sig_type,
+        
+        format!("0x{}", encode(signature.to_vec()))
+    );
+    Ok(signed)
 }

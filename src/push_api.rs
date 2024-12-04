@@ -61,7 +61,8 @@ impl PushAPI {
         }
 
         if self.account.is_none() {
-            self.account = Some(self.signer.clone().unwrap().address().to_string());
+            let signer_address = format!("{:?}", self.signer.clone().unwrap().address());
+            self.account = Some(signer_address);
         }
 
         let version = self.version.clone().unwrap_or_else(|| Version::EncTypeV3);
