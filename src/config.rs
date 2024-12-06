@@ -22,8 +22,8 @@ impl Env {
 
 const API_BASE_URL: &[(Env, &str)] = &[
     (Env::Prod, "https://backend.epns.io/apis"),
-    (Env::Staging, "https://backend.epns.io/apis"),
-    (Env::Dev, "https://backend.epns.io/apis"),
+    (Env::Staging, "https://backend-staging.epns.io/apis"),
+    (Env::Dev, "https://backend-dev.epns.io/apis"),
 ];
 
 const COMMUNICATOR_CONTRACT: &[(Env, &str)] = &[

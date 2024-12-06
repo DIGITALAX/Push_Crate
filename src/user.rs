@@ -1,4 +1,10 @@
-use ethers::signers::{LocalWallet, Signer};
+use ethers::{
+    middleware::SignerMiddleware,
+    prelude::*,
+    providers::{Http, Provider},
+    signers::LocalWallet,
+    utils::to_checksum,
+};
 use hex::encode;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use reqwest::ClientBuilder;
@@ -7,6 +13,7 @@ use serde_json::{json, to_string, Value};
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -69,14 +76,15 @@ impl User {
 
     pub async fn get(
         &self,
-        signer: &LocalWallet,
+        signer: &SignerMiddleware<Arc<Provider<Http>>, LocalWallet>,
         api_base_url: &str,
         decrypted_pgp_pvt_key: Option<String>,
         pgp_public_key: Option<String>,
         version: &Version,
         additional_metadata: Option<AdditionalMeta>,
     ) -> Result<Self, Box<dyn Error>> {
-        let signer_address = format!("{:?}", signer.address());
+        let signer_address = to_checksum(&signer.address(), None);
+
         let caip10_account = wallet_to_pcaip10(&signer_address);
 
         let request_url = format!("{}/v2/users/?caip10={}", api_base_url, caip10_account);
@@ -135,7 +143,7 @@ impl User {
 
     pub async fn create(
         &mut self,
-        signer: &LocalWallet,
+        signer: &SignerMiddleware<Arc<Provider<Http>>, LocalWallet>,
         api_base_url: &str,
         version: &Version,
     ) -> Result<Self, Box<dyn Error>> {
@@ -145,19 +153,17 @@ impl User {
             .unwrap();
         let create_url = format!("{}/v2/users/", api_base_url);
         let additional_meta = get_additional_meta();
-        let secret = get_secret(&version, signer).await?;
 
-        let key_pair = generate_key_pair()?;
+        let key_pair = generate_key_pair().await?;
         let public_key = key_pair.public_key;
         let private_key = key_pair.private_key;
 
         let prepared_public_key = prepare_pgp_public_key(&version, &public_key)?;
-        let encrypted_private_key = to_string(
-            &encrypt_private_key(signer, &version, &private_key, &secret, additional_meta).await?,
-        )
-        .map_err(|_| "Failed to serialize encryptedPrivateKey")?;
+        let encrypted_private_key =
+            to_string(&encrypt_private_key(signer, &version, &private_key, additional_meta).await?)
+                .map_err(|_| "Failed to serialize encryptedPrivateKey")?;
 
-        let signer_address = format!("{:?}", signer.address());
+        let signer_address = to_checksum(&signer.address(), None);
 
         let caip10 = wallet_to_pcaip10(&signer_address);
 
@@ -187,6 +193,7 @@ impl User {
                 .unwrap()
                 .clone(),
         );
+
         let create_response = client
             .post(&create_url)
             .json(&create_payload)
@@ -219,9 +226,9 @@ impl User {
 
 fn wallet_to_pcaip10(account: &str) -> String {
     if account.contains("eip155:") {
-        account.to_lowercase()
+        account.to_string()
     } else {
-        format!("eip155:{}", account.to_lowercase())
+        format!("eip155:{}", account)
     }
 }
 
@@ -231,28 +238,6 @@ fn generate_random_secret(length: usize) -> String {
         .take(length)
         .map(char::from)
         .collect()
-}
-
-async fn get_secret(version: &Version, wallet: &LocalWallet) -> Result<Vec<u8>, Box<dyn Error>> {
-    match version {
-        Version::EncTypeV1 => {
-            let public_key = wallet.address().as_bytes().to_vec();
-            Ok(public_key)
-        }
-        Version::EncTypeV2 => {
-            let input = generate_random_secret(32);
-            let enable_message = format!("Enable Push Chat Profile \n{}", input);
-            let signature = wallet.sign_message(enable_message.as_bytes()).await?;
-            Ok(signature.to_vec())
-        }
-        Version::EncTypeV3 => {
-            let input = generate_random_secret(32);
-            let enable_message = format!("Enable Push Profile \n{}", input);
-            let signature = wallet.sign_message(enable_message.as_bytes()).await?;
-            Ok(signature.to_vec())
-        }
-        Version::EncTypeV4 => Err("ENC_TYPE_V4 requires additional_meta with password".into()),
-    }
 }
 
 fn get_additional_meta() -> Option<AdditionalMeta> {

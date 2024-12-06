@@ -2,12 +2,12 @@ use crate::{
     config::{get_api_base_url, Env},
     user::{AdditionalMeta, User},
 };
-use ethers::{prelude::*, signers::Signer};
-use std::error::Error;
+use ethers::{prelude::*, utils::to_checksum};
+use std::{error::Error, sync::Arc};
 
 #[derive(Debug)]
 pub struct PushAPI {
-    pub signer: Option<LocalWallet>,
+    pub signer: Option<SignerMiddleware<Arc<Provider<Http>>, LocalWallet>>,
     pub account: Option<String>,
     pub version: Option<Version>,
     pub env: Env,
@@ -36,7 +36,7 @@ impl Version {
 impl PushAPI {
     pub fn new(
         env: Env,
-        signer: Option<LocalWallet>,
+        signer: Option<SignerMiddleware<Arc<Provider<Http>>, LocalWallet>>,
         account: Option<String>,
         version: Option<Version>,
     ) -> Self {
@@ -61,7 +61,9 @@ impl PushAPI {
         }
 
         if self.account.is_none() {
-            let signer_address = format!("{:?}", self.signer.clone().unwrap().address());
+            let signer_address = to_checksum(&self.signer.clone().unwrap().address(), None);
+
+            println!("{}", signer_address);
             self.account = Some(signer_address);
         }
 
@@ -82,12 +84,8 @@ impl PushAPI {
             )
             .await?;
         } else if create && self.signer.is_some() {
-            user.create(
-                &self.signer.clone().unwrap(),
-                &api_base_url,
-                &version,
-            )
-            .await?;
+            user.create(&self.signer.clone().unwrap(), &api_base_url, &version)
+                .await?;
         }
 
         self.user = Some(user);

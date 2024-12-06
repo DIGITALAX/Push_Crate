@@ -1,13 +1,18 @@
 #[cfg(test)]
 mod tests {
     use dotenv::dotenv;
-    use ethers::signers::LocalWallet;
+    use ethers::{
+        middleware::SignerMiddleware,
+        providers::{Http, Provider},
+        signers::{LocalWallet, Signer},
+        types::Chain,
+    };
     use push_crate::{
         config::Env,
         push_api::{PushAPI, Version},
     };
-    use rand::rngs::OsRng;
-    use std::sync::Once;
+    use rand::thread_rng;
+    use std::sync::{Arc, Once};
 
     static INIT: Once = Once::new();
 
@@ -22,13 +27,13 @@ mod tests {
         dotenv().ok();
         setup_logging();
 
-        // let signer =
-        //     LocalWallet::from_str(&env::var("SIGNER").expect("SIGNER must be set in .env file"))
-        //         .expect("Failed to create LocalWallet");
-        let mut rng = OsRng;
-        let signer = LocalWallet::new(&mut rng);
+        let provider = Arc::new(Provider::<Http>::try_from("https://eth-sepolia.g.alchemy.com/v2/demo").unwrap());
 
-        let mut push = PushAPI::new(Env::Staging, Some(signer), None, Some(Version::EncTypeV3));
+        let wallet = LocalWallet::new(&mut thread_rng()).with_chain_id(Chain::Sepolia);
+
+        let signer = SignerMiddleware::new(provider.clone(), wallet);
+  
+        let mut push = PushAPI::new(Env::Prod, Some(signer), None, Some(Version::EncTypeV3));
         let result = push.initialize(true, None, None, None).await;
 
         assert!(result.is_ok(), "Initialization failed: {:?}", result);
